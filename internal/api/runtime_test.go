@@ -14,6 +14,7 @@ import (
 	"orbitlink/internal/receiver"
 	"orbitlink/internal/rf"
 	"orbitlink/internal/satellite"
+	"orbitlink/internal/scheduler"
 	"orbitlink/internal/weather"
 )
 
@@ -121,6 +122,50 @@ func TestRouterRejectsOverlappingReservation(t *testing.T) {
 	}
 	if _, err := runtime.Reservations.ReservePass(second.ID, second.AntennaID); err == nil {
 		t.Fatal("overlapping reservation unexpectedly succeeded")
+	}
+}
+
+func TestExecuteDuePointingReportsClassifiedFailure(t *testing.T) {
+	runtime := newTestRuntime(t)
+	router, err := NewRouter(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	// Queue two due commands for a pass that does not own the antenna: every
+	// hardware drive fails with an ownership error.
+	passID := "PASS-UNOWNED"
+	if err := runtime.Commands.Replace(passID, 1, []scheduler.PointingCommand{
+		{AntennaID: "ANT-02", ExecuteAt: time.Now().Add(-time.Minute), Azimuth: 90, Elevation: 10},
+		{AntennaID: "ANT-02", ExecuteAt: time.Now().Add(-30 * time.Second), Azimuth: 95, Elevation: 12},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := server.Client().Post(server.URL+"/api/antennas/execute-due", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("expected 207 multi-status, got %d", response.StatusCode)
+	}
+	var body struct {
+		Executed []json.RawMessage `json:"executed"`
+		Failure  *struct {
+			Command json.RawMessage `json:"command"`
+			Error   string          `json:"error"`
+		} `json:"failure"`
+		Retry   []json.RawMessage `json:"retry"`
+		Retired []json.RawMessage `json:"retired"`
+	}
+	decodeBody(t, response, &body)
+	if body.Failure == nil || body.Failure.Error == "" {
+		t.Fatalf("expected failure details, got %#v", body)
+	}
+	if len(body.Executed) != 0 || len(body.Retry) != 1 || len(body.Retired) != 0 {
+		t.Fatalf("expected one retry command, got executed=%d retry=%d retired=%d", len(body.Executed), len(body.Retry), len(body.Retired))
 	}
 }
 

@@ -56,12 +56,12 @@ func (r *Runtime) enableTransmit(writer http.ResponseWriter, request *http.Reque
 }
 
 func (r *Runtime) executeDuePointing(writer http.ResponseWriter, _ *http.Request) {
-	commands, err := r.Executor.RunDue(time.Now().UTC())
+	result, err := r.Executor.RunDue(time.Now().UTC())
 	if err != nil {
-		writeError(writer, err)
+		writeJSON(writer, http.StatusUnprocessableEntity, result)
 		return
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"executed": commands})
+	writeJSON(writer, http.StatusOK, result)
 }
 
 func (r *Runtime) importEphemeris(writer http.ResponseWriter, request *http.Request) {

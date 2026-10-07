@@ -9,11 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"orbitlink/internal/antenna"
 	stationclock "orbitlink/internal/clock"
 	passsvc "orbitlink/internal/pass"
 	"orbitlink/internal/receiver"
 	"orbitlink/internal/rf"
 	"orbitlink/internal/satellite"
+	"orbitlink/internal/scheduler"
 	"orbitlink/internal/weather"
 )
 
@@ -121,6 +123,53 @@ func TestRouterRejectsOverlappingReservation(t *testing.T) {
 	}
 	if _, err := runtime.Reservations.ReservePass(second.ID, second.AntennaID); err == nil {
 		t.Fatal("overlapping reservation unexpectedly succeeded")
+	}
+}
+
+func TestExecuteDuePointingReportsQueueBoundary(t *testing.T) {
+	runtime := newTestRuntime(t)
+	router, err := NewRouter(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(router)
+	defer server.Close()
+	value := runtime.Passes.List()[0]
+	now := time.Now().UTC()
+	if err := runtime.Commands.Replace(value.ID, 2, []scheduler.PointingCommand{
+		{AntennaID: value.AntennaID, ExecuteAt: now.Add(-2 * time.Second), Azimuth: 10, Elevation: 20},
+		{AntennaID: value.AntennaID, ExecuteAt: now.Add(-time.Second), Azimuth: 20, Elevation: 30},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/antennas/execute-due", "")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("execute-due returned %d", response.StatusCode)
+	}
+	var result antenna.RunResult
+	decodeBody(t, response, &result)
+	if len(result.Executed) != 2 || len(result.PendingRetry) != 0 || len(result.Retired) != 0 {
+		t.Fatalf("unexpected execute-due result: %#v", result)
+	}
+	response = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/antennas/execute-due", "")
+	var again antenna.RunResult
+	decodeBody(t, response, &again)
+	if len(again.Executed) != 0 {
+		t.Fatalf("execute-due re-executed acknowledged commands: %#v", again)
+	}
+	if err := runtime.Commands.Replace(value.ID, 3, []scheduler.PointingCommand{
+		{AntennaID: value.AntennaID, ExecuteAt: now.Add(-time.Second), Azimuth: 10, Elevation: 95},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/antennas/execute-due", "")
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("failing execute-due returned %d", response.StatusCode)
+	}
+	var failed antenna.RunResult
+	decodeBody(t, response, &failed)
+	if failed.Failure == "" || len(failed.PendingRetry) != 1 || len(failed.Executed) != 0 {
+		t.Fatalf("failure result missing executed/pending/retired breakdown: %#v", failed)
 	}
 }
 

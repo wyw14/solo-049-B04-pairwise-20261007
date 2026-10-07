@@ -18,16 +18,50 @@ func NewExecutor(fleet *Fleet, queue *scheduler.CommandQueue, trail *audit.Trail
 	return &Executor{fleet: fleet, queue: queue, audit: trail}
 }
 
-func (e *Executor) RunDue(now time.Time) ([]scheduler.PointingCommand, error) {
-	commands := e.queue.Due(now)
-	executed := make([]scheduler.PointingCommand, 0, len(commands))
-	for _, command := range commands {
-		if err := e.Execute(command); err != nil {
-			return executed, err
-		}
-		executed = append(executed, command)
+// RunResult partitions one RunDue pass: every due command lands in exactly
+// one bucket. Executed commands ran and were acknowledged to the queue,
+// PendingRetry commands remain due (the failed command first, then the
+// commands that were never attempted), and Retired commands were superseded
+// by a newer revision before they could run.
+type RunResult struct {
+	Executed     []scheduler.PointingCommand `json:"executed"`
+	PendingRetry []scheduler.PointingCommand `json:"pending_retry"`
+	Retired      []scheduler.PointingCommand `json:"retired"`
+	Failure      string                      `json:"failure,omitempty"`
+}
+
+func (e *Executor) RunDue(now time.Time) (RunResult, error) {
+	return e.runCommands(e.queue.Due(now))
+}
+
+func (e *Executor) runCommands(commands []scheduler.PointingCommand) (RunResult, error) {
+	result := RunResult{
+		Executed:     make([]scheduler.PointingCommand, 0, len(commands)),
+		PendingRetry: []scheduler.PointingCommand{},
+		Retired:      []scheduler.PointingCommand{},
 	}
-	return executed, nil
+	for index, command := range commands {
+		if !e.queue.IsExecutable(command) {
+			// A replan retired this revision after the due snapshot was taken.
+			result.Retired = append(result.Retired, command)
+			continue
+		}
+		if err := e.Execute(command); err != nil {
+			result.PendingRetry = append(result.PendingRetry, commands[index:]...)
+			result.Failure = err.Error()
+			return result, fmt.Errorf("run due pointing commands: %w", err)
+		}
+		// Acknowledge each command before moving on so a later failure can
+		// never cause an already-executed command to run again.
+		acknowledged, err := e.queue.Acknowledge(command.ID)
+		if err != nil {
+			result.PendingRetry = append(result.PendingRetry, commands[index:]...)
+			result.Failure = err.Error()
+			return result, fmt.Errorf("acknowledge pointing command %s: %w", command.ID, err)
+		}
+		result.Executed = append(result.Executed, acknowledged...)
+	}
+	return result, nil
 }
 
 func (e *Executor) Execute(command scheduler.PointingCommand) error {

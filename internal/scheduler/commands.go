@@ -19,6 +19,8 @@ type PointingCommand struct {
 	ExecuteAt   time.Time `json:"execute_at"`
 	Azimuth     float64   `json:"azimuth"`
 	Elevation   float64   `json:"elevation"`
+	Executed    bool      `json:"executed"`
+	ExecutedAt  time.Time `json:"executed_at,omitempty"`
 	Retired     bool      `json:"retired"`
 	RetireCause string    `json:"retire_cause,omitempty"`
 }
@@ -73,7 +75,7 @@ func (q *CommandQueue) Due(now time.Time) []PointingCommand {
 	defer q.mu.RUnlock()
 	var values []PointingCommand
 	for _, command := range q.commands {
-		if !command.Retired && command.Revision == q.active[command.PassID] && !command.ExecuteAt.After(now) {
+		if !command.Retired && !command.Executed && command.Revision == q.active[command.PassID] && !command.ExecuteAt.After(now) {
 			values = append(values, command)
 		}
 	}
@@ -81,10 +83,45 @@ func (q *CommandQueue) Due(now time.Time) []PointingCommand {
 	return values
 }
 
+// Acknowledge marks queued commands as executed so Due stops returning them.
+// It is idempotent: an already-executed command is reported again without
+// changing its ExecutedAt timestamp.
+func (q *CommandQueue) Acknowledge(ids ...string) ([]PointingCommand, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	indexes := make([]int, 0, len(ids))
+	for _, id := range ids {
+		index := -1
+		for candidate := range q.commands {
+			if q.commands[candidate].ID == id {
+				index = candidate
+				break
+			}
+		}
+		if index < 0 {
+			return nil, fmt.Errorf("pointing command %s is not queued", id)
+		}
+		indexes = append(indexes, index)
+	}
+	at := time.Now().UTC()
+	acknowledged := make([]PointingCommand, 0, len(ids))
+	for _, index := range indexes {
+		if !q.commands[index].Executed {
+			q.commands[index].Executed = true
+			q.commands[index].ExecutedAt = at
+		}
+		acknowledged = append(acknowledged, q.commands[index])
+	}
+	if err := store.WriteJSON(q.path, q.commands); err != nil {
+		return nil, fmt.Errorf("persist acknowledged pointing commands: %w", err)
+	}
+	return acknowledged, nil
+}
+
 func (q *CommandQueue) IsExecutable(command PointingCommand) bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	return !command.Retired && command.Revision == q.active[command.PassID]
+	return !command.Retired && !command.Executed && command.Revision == q.active[command.PassID]
 }
 
 func (q *CommandQueue) List(passID string) []PointingCommand {
